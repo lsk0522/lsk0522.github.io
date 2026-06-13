@@ -1,11 +1,11 @@
-"""ESP32 + DM542 스텝모터 시리얼 통신 — 통합 펌웨어 대응 (thread-safe 개선판)"""
+"""ESP32 + DM542 스텝모터 시리얼 통신 — 통합 펌웨어 대응 (thread-safe)"""
 
-import glob
 import threading
 import time
 import queue
 
 import state
+from serial_utils import find_port
 
 try:
     import serial
@@ -14,41 +14,22 @@ except ImportError:
     _serial_ok = False
     print("[esp32] pyserial 없음 → pip install pyserial")
 
+# ── 전역 상태 ─────────────────────────────────────────────
 _ser      = None
 _thread   = None
 _port     = None
-_ser_lock = threading.Lock()   # Protect _ser from concurrent read/write across threads
+_ser_lock = threading.Lock()
 
-# ─── 위치 제어 우선순위 큐 ────────────────────────────────────
-_move_queue          = queue.PriorityQueue(maxsize=20)  # Bounded to prevent unbounded growth
+# ── 위치 제어 우선순위 큐 ──────────────────────────────────
+_move_queue          = queue.PriorityQueue(maxsize=20)
 _seq_counter         = 0
 _seq_lock            = threading.Lock()
 _first_pos_sync      = True
 _queue_worker_thread = None
-_abort_event         = threading.Event()  # Replaces plain bool flag (thread-safe)
+_abort_event         = threading.Event()
 
-import sys
-
-def _find_port():
-    """Find the first available serial port, preferring known ESP32 USB VID/PID."""
-    if sys.platform.startswith('win'):
-        try:
-            import serial.tools.list_ports
-            # Prefer known ESP32 USB-UART chips by VID (CP210x=0x10C4, CH340=0x1A86, FTDI=0x0403)
-            ESP32_VIDS = {0x10C4, 0x1A86, 0x0403}
-            ports = list(serial.tools.list_ports.comports())
-            for p in ports:
-                if p.vid in ESP32_VIDS:
-                    return p.device
-            # Fallback: first available port
-            return ports[0].device if ports else None
-        except Exception:
-            return None
-    else:
-        candidates = sorted(
-            glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
-        )
-        return candidates[0] if candidates else None
+# ESP32 USB VID (CP210x, CH340, FTDI)
+_ESP32_VIDS = {0x10C4, 0x1A86, 0x0403}
 
 
 def connect(port=None, baudrate=115200):
@@ -57,7 +38,7 @@ def connect(port=None, baudrate=115200):
         return
 
     if port is None:
-        port = _find_port()
+        port = find_port(preferred_vids=_ESP32_VIDS)
 
     if port is None:
         print("[esp32] 포트를 찾을 수 없음")
@@ -67,8 +48,7 @@ def connect(port=None, baudrate=115200):
 
     try:
         new_ser = serial.Serial(port, baudrate, timeout=0.05)
-        # ESP32 resets on serial connect — wait in background to avoid blocking
-        time.sleep(2)
+        time.sleep(2)   # ESP32 리셋 대기
         with _ser_lock:
             _ser  = new_ser
             _port = port
@@ -83,7 +63,7 @@ def connect(port=None, baudrate=115200):
 
 
 def safe_disconnect():
-    """Thread-safe disconnect — called from Flask routes without disrupting _run()."""
+    """Thread-safe disconnect — Flask 라우트에서 호출 가능."""
     global _ser
     with _ser_lock:
         if _ser and _ser.is_open:
@@ -96,7 +76,7 @@ def safe_disconnect():
 
 
 def _send(cmd: str):
-    """Thread-safe serial write."""
+    """Thread-safe 시리얼 쓰기."""
     global _ser
     with _ser_lock:
         if _ser is None:
@@ -114,27 +94,7 @@ def _send(cmd: str):
 
 
 def _parse_status(line: str):
-    """Parse ST: (track mode) or POS: (position mode) feedback from ESP32."""
-
-    if line.startswith("ST:"):
-        try:
-            parts = line[3:].split(":")
-            if len(parts) < 8:
-                return
-            state.motor_target_x = int(parts[0])
-            state.motor_target_y = int(parts[1])
-            state.motor_error_x  = int(parts[2])
-            state.motor_error_y  = int(parts[3])
-            state.motor_steps_m1 = int(parts[4])
-            state.motor_steps_m2 = int(parts[5])
-            st = int(parts[6])
-            state.motor_moving  = (st == 1)
-            state.motor_timeout = (st == 2)
-            state.motor_stopped = (st == 3)
-        except Exception:
-            pass
-        return
-
+    """POS: 피드백 파싱."""
     if line.startswith("POS:"):
         global _first_pos_sync
         try:
@@ -152,7 +112,6 @@ def _parse_status(line: str):
                 _first_pos_sync = False
         except Exception:
             pass
-        return
 
 
 _rx_buf = ""
@@ -160,12 +119,12 @@ _rx_buf = ""
 
 def _run():
     global _rx_buf, _ser
-    last_x, last_y  = 320, 240
-    last_t_time     = 0.0
-    last_pos_req    = 0.0
+    last_x, last_y = 320, 240
+    last_t_time    = 0.0
+    last_pos_req   = 0.0
 
     while True:
-        # Release port if device type changed
+        # device_type이 esp32가 아니면 포트 해제
         if state.device_type != "esp32":
             with _ser_lock:
                 if _ser and _ser.is_open:
@@ -189,7 +148,7 @@ def _run():
 
         state.motor_connected = True
 
-        # Serial receive
+        # 시리얼 수신
         try:
             with _ser_lock:
                 if _ser and _ser.is_open:
@@ -213,7 +172,7 @@ def _run():
 
         now = time.time()
 
-        # Send T:x:y in track mode (throttled + 200ms heartbeat)
+        # track 모드: T:x:y 전송 (throttled + 200ms heartbeat)
         if state.esp32_control_mode == "track":
             x, y = state.point[0], state.point[1]
             if abs(x - last_x) >= 1 or abs(y - last_y) >= 1 or (now - last_t_time > 0.2):
@@ -221,7 +180,7 @@ def _run():
                 last_x, last_y = x, y
                 last_t_time = now
 
-        # Periodic POS request every 100ms
+        # POS 주기 요청 (100ms)
         if now - last_pos_req > 0.1:
             _send("POS\n")
             last_pos_req = now
@@ -230,19 +189,18 @@ def _run():
 
 
 def send_config(key: str, value):
-    """Send CFG:KEY:VALUE command (tracking mode parameter)."""
+    """CFG:KEY:VALUE 명령 전송 (속도/가속도/steps 등 실시간 변경)."""
     _send(f"CFG:{key}:{value}\n")
 
 
 def set_mode(mode: str):
-    """Switch mode: 'track' or 'pos'. Only updates state if serial is connected."""
+    """'track' 또는 'pos' 모드 전환. 연결 시에만 state 업데이트."""
     with _ser_lock:
         connected = _ser is not None and _ser.is_open
     if connected:
         cmd = "MODE:TRACK" if mode == "track" else "MODE:POS"
         _send(cmd + "\n")
-        state.esp32_control_mode = mode  # Only update when command actually sent
-    # If not connected, leave state unchanged so queue worker doesn't get confused
+        state.esp32_control_mode = mode
 
 
 def _get_next_seq():
@@ -253,10 +211,11 @@ def _get_next_seq():
 
 
 def enqueue_move(target: str, val: float, is_absolute: bool = True):
+    """이동 명령을 우선순위 큐에 추가."""
     global _move_queue
     axis = target.upper().replace(' ', '')
 
-    # Sync queued target to real position when queue is idle
+    # 큐가 비었으면 queued target을 실제 위치에 동기화
     if _move_queue.empty():
         state.last_queued_target_m1 = state.esp32_pos_m1_mm
         state.last_queued_target_m2 = state.esp32_pos_m2_mm
@@ -265,82 +224,72 @@ def enqueue_move(target: str, val: float, is_absolute: bool = True):
     if not valid_axes:
         return False
 
-    # M1,M2 simultaneous: single queue item → one "MOVE J M1,M2 <mm>" command
+    # M1,M2 동시 이동
     if len(valid_axes) == 2:
         if is_absolute:
-            target_abs = val
-            priority = 10
+            target_abs, priority = val, 10
         else:
-            target_abs = state.last_queued_target_m1 + val
-            priority = 20
+            target_abs, priority = state.last_queued_target_m1 + val, 20
         state.last_queued_target_m1 = target_abs
         state.last_queued_target_m2 = target_abs
-        seq = _get_next_seq()
         try:
-            _move_queue.put_nowait((priority, seq, 'M1,M2', target_abs))
+            _move_queue.put_nowait((_get_next_seq(), priority, 'M1,M2', target_abs))
         except queue.Full:
-            pass  # Drop if queue is full (bounded queue)
+            pass
         return True
 
-    # Single axis
+    # 단일 축
     a = valid_axes[0]
     if is_absolute:
-        target_abs = val
-        priority = 10
+        target_abs, priority = val, 10
     else:
-        if a == 'M1':
-            target_abs = state.last_queued_target_m1 + val
-        else:
-            target_abs = state.last_queued_target_m2 + val
-        priority = 20
+        base = state.last_queued_target_m1 if a == 'M1' else state.last_queued_target_m2
+        target_abs, priority = base + val, 20
 
     if a == 'M1':
         state.last_queued_target_m1 = target_abs
     else:
         state.last_queued_target_m2 = target_abs
 
-    seq = _get_next_seq()
     try:
-        _move_queue.put_nowait((priority, seq, a, target_abs))
+        _move_queue.put_nowait((_get_next_seq(), priority, a, target_abs))
     except queue.Full:
         pass
     return True
 
 
 def move_mm(target: str, mm: float):
-    """Absolute position move (enqueue)."""
+    """절대 위치 이동 (큐 추가)."""
     return enqueue_move(target, mm, is_absolute=True)
 
 
 def move_relative_mm(target: str, delta: float):
-    """Relative position move (enqueue)."""
+    """상대 위치 이동 (큐 추가)."""
     return enqueue_move(target, delta, is_absolute=False)
 
 
 def _queue_worker():
     while True:
         try:
-            priority, seq, axis, target_mm = _move_queue.get(timeout=0.1)
+            seq, priority, axis, target_mm = _move_queue.get(timeout=0.1)
         except queue.Empty:
             continue
 
         with _ser_lock:
             connected = _ser is not None and _ser.is_open
         if not connected:
-            print("[esp32-queue] 연결되지 않음. 작업 스킵.")
             _move_queue.task_done()
             continue
 
         _abort_event.clear()
 
-        # Auto-switch to POS mode
+        # POS 모드 자동 전환
         if state.esp32_control_mode != "pos":
             _send("MODE:POS\n")
             state.esp32_control_mode = "pos"
             time.sleep(0.1)
 
         cmd = f"MOVE J {axis} {target_mm:.3f}\n"
-        print(f"[esp32-queue] 전송: {cmd.strip()} (priority={priority}, seq={seq})")
         _send(cmd)
 
         dist = 0.0
@@ -350,38 +299,26 @@ def _queue_worker():
             dist = max(dist, abs(target_mm - state.esp32_pos_m2_mm))
 
         max_spd = state.esp32_max_speed_hz / max(state.esp32_steps_per_mm_m1, 1)
-        duration_est = dist / max_spd if max_spd > 0 else 0
-        timeout = max(2.0, duration_est * 3.0 + 2.0)
-        timeout = min(8.0, timeout)
+        timeout = min(8.0, max(2.0, dist / max_spd * 3.0 + 2.0) if max_spd > 0 else 2.0)
 
         DONE_THRESHOLD = 0.30
-
         start_time = time.time()
         time.sleep(0.05)
 
         while time.time() - start_time < timeout:
             if _abort_event.is_set():
-                print(f"[esp32-queue] 중단됨: {axis} -> {target_mm:.3f}mm")
                 break
-
-            m1_done = True
-            m2_done = True
-            if 'M1' in axis:
-                m1_done = (abs(state.esp32_pos_m1_mm - target_mm) < DONE_THRESHOLD)
-            if 'M2' in axis:
-                m2_done = (abs(state.esp32_pos_m2_mm - target_mm) < DONE_THRESHOLD)
-
-            if m1_done and m2_done:
+            m1_ok = (abs(state.esp32_pos_m1_mm - target_mm) < DONE_THRESHOLD) if 'M1' in axis else True
+            m2_ok = (abs(state.esp32_pos_m2_mm - target_mm) < DONE_THRESHOLD) if 'M2' in axis else True
+            if m1_ok and m2_ok:
                 break
             time.sleep(0.01)
 
-        elapsed = time.time() - start_time
-        print(f"[esp32-queue] 완료: {axis} -> {target_mm:.3f}mm (경과: {elapsed:.2f}s)")
         _move_queue.task_done()
 
 
 def set_home():
-    """Set current position as home (0mm)."""
+    """현재 위치를 원점(0mm)으로 설정."""
     with _ser_lock:
         connected = _ser is not None and _ser.is_open
     if connected:
@@ -394,14 +331,18 @@ def set_home():
     return False
 
 
-def request_status():
-    """Request immediate POS feedback."""
-    _send("STATUS\n")
-
-
-def send_mm_config(key: str, value):
-    """Send position-control CFG parameter."""
-    _send(f"CFG:{key}:{value}\n")
+def stop_motors():
+    """활성 이동 중단 및 큐 비우기."""
+    _abort_event.set()
+    while not _move_queue.empty():
+        try:
+            _move_queue.get_nowait()
+            _move_queue.task_done()
+        except Exception:
+            break
+    state.last_queued_target_m1 = state.esp32_pos_m1_mm
+    state.last_queued_target_m2 = state.esp32_pos_m2_mm
+    _send("S\n")
 
 
 def start(port=None):
@@ -411,19 +352,3 @@ def start(port=None):
     _thread.start()
     _queue_worker_thread = threading.Thread(target=_queue_worker, daemon=True)
     _queue_worker_thread.start()
-
-
-def stop_motors():
-    """Abort active movement and flush the queue."""
-    _abort_event.set()
-    # Drain queue
-    while not _move_queue.empty():
-        try:
-            _move_queue.get_nowait()
-            _move_queue.task_done()
-        except Exception:
-            break
-    # Sync queued target to current real position
-    state.last_queued_target_m1 = state.esp32_pos_m1_mm
-    state.last_queued_target_m2 = state.esp32_pos_m2_mm
-    _send("S\n")

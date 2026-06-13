@@ -3,21 +3,14 @@ Arduino Uno + DM542 스텝모터 시리얼 통신
 
 전송: JSON 패킷 1회 (Apply/E-Stop/Home 버튼 클릭 시에만)
 수신: {"id":1,"pos":123} 형태 위치 피드백
-
-Arduino Uno SRAM(2KB) 절약을 위해 JSON 키를 최대한 짧게 유지:
-  id  = motor_id (1 or 2)
-  pos = target position (steps) / current position (steps)
-  spd = max_speed (steps/s)
-  acc = accel
-  cmd = "RUN" | "STOP" | "HOME"
 """
 
-import glob
 import json
 import threading
 import time
 
 import state
+from serial_utils import find_port
 
 try:
     import serial
@@ -32,30 +25,13 @@ _port   = None
 _lock   = threading.Lock()
 
 
-import sys
-
-def _find_port():
-    if sys.platform.startswith('win'):
-        try:
-            import serial.tools.list_ports
-            ports = [p.device for p in serial.tools.list_ports.comports()]
-            return ports[0] if ports else None
-        except Exception:
-            return None
-    else:
-        candidates = sorted(
-            glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
-        )
-        return candidates[0] if candidates else None
-
-
 def connect(port=None, baudrate=115200):
     global _ser, _port
     if not _serial_ok or state.device_type != "arduino":
         return
 
     if port is None:
-        port = _find_port()
+        port = find_port()   # Arduino는 VID 필터 없이 첫 번째 포트
 
     if port is None:
         print("[arduino] 포트를 찾을 수 없음")
@@ -66,7 +42,7 @@ def connect(port=None, baudrate=115200):
     try:
         _ser  = serial.Serial(port, baudrate, timeout=0.05)
         _port = port
-        time.sleep(2)          # 아두이노 리셋 대기
+        time.sleep(2)   # 아두이노 리셋 대기
         state.motor_connected = True
         state.motor_port = port
         print(f"[arduino] 연결: {port}")
@@ -78,14 +54,13 @@ def connect(port=None, baudrate=115200):
 
 
 def _send_packet(packet: dict) -> bool:
-    """JSON 패킷 단일 전송"""
+    """JSON 패킷 단일 전송."""
     global _ser
     with _lock:
         if not _ser or not _ser.is_open:
             return False
         try:
-            line = json.dumps(packet, separators=(',', ':')) + '\n'
-            _ser.write(line.encode())
+            _ser.write((json.dumps(packet, separators=(',', ':')) + '\n').encode())
             return True
         except Exception as e:
             print(f"[arduino] 전송 오류: {e}")
@@ -101,12 +76,12 @@ def _send_packet(packet: dict) -> bool:
 def send_config(dead_zone: int, max_steps: int, steps_per_px: float,
                 pulse_us: int, cmd_timeout_ms: int,
                 m1_invert: bool, m2_invert: bool) -> bool:
-    """파라미터 설정 JSON을 Arduino에 1회 전송 (Apply 버튼 클릭 시)"""
+    """파라미터 설정 JSON을 Arduino에 1회 전송."""
     return _send_packet({
         "cmd": "CFG",
         "dz":  dead_zone,
         "ms":  max_steps,
-        "sp":  round(steps_per_px * 1000),  # Arduino 측에서 /1000 처리
+        "sp":  round(steps_per_px * 1000),
         "pu":  pulse_us,
         "to":  cmd_timeout_ms,
         "m1i": 1 if m1_invert else 0,
@@ -119,40 +94,31 @@ def degrees_to_steps(degrees: float) -> int:
 
 
 def run(motor_id: int, degrees: float, max_speed: int, accel: int) -> bool:
-    """[Apply/RUN 버튼 클릭 시] 명령 패킷 1회 전송"""
+    """RUN 명령 패킷 1회 전송."""
     steps = degrees_to_steps(degrees)
-    return _send_packet({
-        "id":  motor_id,
-        "pos": steps,
-        "spd": max_speed,
-        "acc": accel,
-        "cmd": "RUN",
-    })
+    return _send_packet({"id": motor_id, "pos": steps,
+                         "spd": max_speed, "acc": accel, "cmd": "RUN"})
 
 
 def estop() -> bool:
-    """비상 정지 — 두 모터 즉시 STOP (최우선 전송)"""
-    ok1 = _send_packet({"id": 1, "cmd": "STOP"})
-    ok2 = _send_packet({"id": 2, "cmd": "STOP"})
-    return ok1 or ok2
+    """비상 정지 — 두 모터 즉시 STOP."""
+    return _send_packet({"id": 1, "cmd": "STOP"}) or _send_packet({"id": 2, "cmd": "STOP"})
 
 
 def home(motor_id: int) -> bool:
-    """원점 복귀"""
+    """원점 복귀."""
     return _send_packet({"id": motor_id, "cmd": "HOME"})
 
 
-# ── 수신 루프 ────────────────────────────────────────────────────
-
+# ── 수신 루프 ─────────────────────────────────────────────
 _rx_buf = ""
 
 
 def _parse_feedback(line: str):
-    """{"id":1,"pos":123} → state 갱신"""
+    """{\"id\":1,\"pos\":123} → state 갱신."""
     try:
         d = json.loads(line)
-        mid = d.get("id")
-        pos = d.get("pos")
+        mid, pos = d.get("id"), d.get("pos")
         if mid == 1 and pos is not None:
             state.arduino_pos_m1 = int(pos)
         elif mid == 2 and pos is not None:
@@ -165,7 +131,6 @@ def _run():
     global _rx_buf, _ser
 
     while True:
-        # device_type이 arduino가 아니면 포트 해제 후 대기
         if state.device_type != "arduino":
             if _ser and _ser.is_open:
                 try:

@@ -1,9 +1,11 @@
 import cv2
+import os
 import threading
 import numpy as np
 import time
 
 import state
+from camera import FRAME_W, FRAME_H
 
 # 학습 영역: 640x480 프레임 중앙 300x300
 _DEFAULT_LEARN_ZONE = (170, 90, 300, 300)   # (x, y, w, h)
@@ -160,6 +162,8 @@ class ORBTracker:
         self._buf      = []
         self._start    = time.time()
         self._cnt      = 0
+        # n_samples에 따라 SAMPLE_EVERY 조정: 많이 수집할수록 잠서 멈춥 없이 매 프레임 수집
+        self._sample_every = max(1, 40 // max(n_samples, 1))
 
     def process_frame(self, frame, prev_frame=None):
         """학습 중 호출 — 피부 + 정적 배경 제외 후 특징 수집"""
@@ -167,7 +171,7 @@ class ORBTracker:
             return
 
         self._cnt += 1
-        if self._cnt % self.SAMPLE_EVERY != 0:
+        if self._cnt % getattr(self, '_sample_every', self.SAMPLE_EVERY) != 0:
             return
 
         x, y, w, h = self.learn_zone
@@ -222,8 +226,31 @@ class ORBTracker:
         self.matcher.train()
         self.active = True
         
-        # 파일 저장 호출
+        # 파일 저장
         self.save_data()
+        
+        # 썸네일 1회 인코딩 후 파일 저장 (route poll 시 재인코딩 방지)
+        self._save_thumbnail()
+
+    def _save_thumbnail(self):
+        """학습 영역 ROI를 thumbnail.jpg로 저장 (route에서 base64 읽기용)."""
+        frame = state.current_frame
+        if frame is None:
+            return
+        x, y, w, h = self.learn_zone
+        img_h, img_w = frame.shape[:2]
+        x1 = max(0, min(img_w - 1, x))
+        y1 = max(0, min(img_h - 1, y))
+        x2 = max(0, min(img_w, x + w))
+        y2 = max(0, min(img_h, y + h))
+        if x2 > x1 and y2 > y1:
+            roi = frame[y1:y2, x1:x2]
+            os.makedirs("learning_data", exist_ok=True)
+            try:
+                cv2.imwrite("learning_data/target_thumbnail.jpg", roi,
+                            [cv2.IMWRITE_JPEG_QUALITY, 82])
+            except Exception:
+                pass
 
     def track(self, frame, motion=None):
         if not self.active or self.matcher is None:
@@ -254,9 +281,11 @@ class ORBTracker:
         pts = np.array([kp[m.queryIdx].pt for m in good], np.float32)
         x, y, w, h = cv2.boundingRect(pts.reshape(-1, 1, 2).astype(np.int32))
         pad = 12
+        max_x = FRAME_W - 1
+        max_y = FRAME_H - 1
         x = max(0, x - pad); y = max(0, y - pad)
-        w = min(639 - x, w + 2 * pad)
-        h = min(479 - y, h + 2 * pad)
+        w = min(max_x - x, w + 2 * pad)
+        h = min(max_y - y, h + 2 * pad)
         return {"cx": x + w // 2, "cy": y + h // 2,
                 "x": x, "y": y, "w": w, "h": h,
                 "matches": len(good), "predicted": False}
@@ -414,8 +443,8 @@ def _run():
         if state.control_mode == "auto" and state.ball:
             tx = state.ball.get("predicted_cx", state.ball["cx"])
             ty = state.ball.get("predicted_cy", state.ball["cy"])
-            state.point[0] = max(0, min(639, tx))
-            state.point[1] = max(0, min(479, ty))
+            state.point[0] = max(0, min(FRAME_W - 1, tx))
+            state.point[1] = max(0, min(FRAME_H - 1, ty))
 
 def start():
     global _thread
